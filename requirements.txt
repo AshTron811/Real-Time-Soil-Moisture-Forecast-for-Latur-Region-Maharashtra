@@ -1,1 +1,8 @@
 earthengine-api
+streamlit
+streamlit-autorefresh
+tensorflow
+pandas
+numpy
+scikit-learn
+python-dateutil
