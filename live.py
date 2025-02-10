@@ -9,6 +9,7 @@ import datetime
 from dateutil.relativedelta import relativedelta
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
+import json
 
 # -----------------------------------------------------------------------------
 # Step A: Compute milliseconds until next midnight (12 AM)
@@ -24,7 +25,18 @@ st_autorefresh(interval=ms_until_midnight, limit=1, key="autoRefresh")
 # -----------------------------------------------------------------------------
 # Step 1: Initialize Earth Engine with your project ID
 # -----------------------------------------------------------------------------
-ee.Initialize(project='ee-ashutosh10615')
+# Load service account credentials from Streamlit secrets
+service_account = "live-sm-predictor@ee-ashutosh10615.iam.gserviceaccount.com"
+
+# Save credentials from secrets
+key_path = "service-account.json"
+with open(key_path, "w") as f:
+    json.dump(dict(st.secrets["gcp_service_account"]), f)  # Ensure correct serialization
+
+# Authenticate with Earth Engine
+credentials = ee.ServiceAccountCredentials(service_account, key_path)
+ee.Initialize(credentials)
+st.success("Google Earth Engine authenticated successfully!")
 
 # -----------------------------------------------------------------------------
 # Step 2: Define Parameters and Region of Interest (ROI)
