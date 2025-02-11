@@ -10,6 +10,8 @@ from dateutil.relativedelta import relativedelta
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 import json
+import os
+import tempfile
 
 # -----------------------------------------------------------------------------
 # Step A: Compute milliseconds until next midnight (12 AM)
@@ -23,28 +25,57 @@ ms_until_midnight = int((midnight - now).total_seconds() * 1000)
 st_autorefresh(interval=ms_until_midnight, limit=1, key="autoRefresh")
 
 # -----------------------------------------------------------------------------
-# Step 1: Initialize Earth Engine with your project ID
+# Step 1: Initialize Earth Engine with your service account credentials
 # -----------------------------------------------------------------------------
-# Load service account credentials from Streamlit secrets
-service_account = "live-sm-predictor@ee-ashutosh10615.iam.gserviceaccount.com"
+if "ee_credentials" not in st.secrets:
+    st.error("Missing 'ee_credentials' in secrets. Please add your service account JSON as a single string under the 'json' key.")
+    st.stop()
 
-# Save credentials from secrets
-key_path = "service-account.json"
-with open(key_path, "w") as f:
-    json.dump(dict(st.secrets["gcp_service_account"]), f)  # Ensure correct serialization
+# Retrieve the key data from Streamlit secrets.
+key_data = st.secrets["ee_credentials"]["json"]
 
-# Authenticate with Earth Engine
-credentials = ee.ServiceAccountCredentials(service_account, key_path)
-ee.Initialize(credentials)
-st.success("Google Earth Engine authenticated successfully!")
+# Ensure key_data is a string.
+if isinstance(key_data, dict):
+    key_data = json.dumps(key_data)
+else:
+    key_data = key_data.strip()
+
+# Parse the JSON to extract the service account email.
+try:
+    creds_dict = json.loads(key_data)
+except Exception as e:
+    st.error(f"Error parsing key_data: {e}")
+    st.stop()
+
+service_account_email = creds_dict["client_email"]
+
+# Write the JSON key to a temporary file.
+with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp_file:
+    tmp_file.write(key_data)
+    tmp_file_path = tmp_file.name
+
+st.write("Using temporary key file:", tmp_file_path)
+
+# Attempt to authenticate using the temporary file.
+try:
+    credentials = ee.ServiceAccountCredentials(service_account_email, tmp_file_path)
+    ee.Initialize(credentials)
+    st.success("✅ Google Earth Engine authenticated successfully!")
+except Exception as e:
+    st.error(f"❌ Earth Engine authentication failed: {e}")
+    st.info("Please ensure your service account JSON is exactly as provided by Google Cloud Console.")
+    st.stop()
+finally:
+    # Optionally remove the temporary file.
+    try:
+        os.remove(tmp_file_path)
+    except Exception as e:
+        st.warning(f"Could not remove temporary key file: {e}")
 
 # -----------------------------------------------------------------------------
 # Step 2: Define Parameters and Region of Interest (ROI)
 # -----------------------------------------------------------------------------
-# Latur region in Maharashtra (approximate coordinates)
 region = ee.Geometry.Rectangle([76.3, 18.2, 76.7, 18.6])
-
-# Use the most recent 12 months of data (from today minus 12 months until today)
 today = datetime.date.today()
 twelve_months_ago = today - relativedelta(months=12)
 start_date = twelve_months_ago.strftime("%Y-%m-%d")
@@ -56,11 +87,9 @@ st.write(f"**Data Range for Model:** {start_date} to {end_date}")
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=ms_until_midnight/1000, show_spinner=True)
 def get_forecast():
-    # Load the SMAP ImageCollection (update asset ID if needed)
     smap_collection = ee.ImageCollection("NASA/SMAP/SPL4SMGP/007").filterDate(start_date, end_date)
     
     def compute_sm_feature(image):
-        # Compute mean surface soil moisture.
         mean_surface = image.select("sm_surface").reduceRegion(
             reducer=ee.Reducer.mean(),
             geometry=region,
@@ -68,8 +97,6 @@ def get_forecast():
             bestEffort=True,
             maxPixels=1e9
         ).get("sm_surface")
-        
-        # Compute mean root zone soil moisture.
         mean_rootzone = image.select("sm_rootzone").reduceRegion(
             reducer=ee.Reducer.mean(),
             geometry=region,
@@ -77,43 +104,30 @@ def get_forecast():
             bestEffort=True,
             maxPixels=1e9
         ).get("sm_rootzone")
-        
-        # Use nested ee.Algorithms.If to flag invalid values.
         isInvalid = ee.Algorithms.If(
             ee.Algorithms.IsEqual(mean_surface, None),
             True,
             ee.Algorithms.IsEqual(mean_rootzone, None)
         )
-        
-        # Compute combined soil moisture (average) if valid.
         combined_sm = ee.Algorithms.If(
             isInvalid,
             None,
             ee.Number(mean_surface).add(ee.Number(mean_rootzone)).divide(2)
         )
-        
-        # Format the image date.
         date_str = image.date().format("YYYY-MM-dd")
         return ee.Feature(None, {"date": date_str, "sm": combined_sm})
     
-    # Map and filter the collection.
     sm_features = smap_collection.map(compute_sm_feature)
     sm_features = sm_features.filter(ee.Filter.notNull(["sm"]))
     
-    # Retrieve the dates and soil moisture values.
     dates_list = sm_features.aggregate_array("date").getInfo()
     sm_list = sm_features.aggregate_array("sm").getInfo()
     
-    # Build the historical DataFrame.
     df = pd.DataFrame({"ds": dates_list, "y": sm_list})
     df["ds"] = pd.to_datetime(df["ds"])
     df = df.sort_values("ds").reset_index(drop=True)
     
-    # ---------------------------
-    # Prepare Data for LSTM Forecasting (Sliding Window)
-    # ---------------------------
-    window_size = 7  # Use a 7-day window
-    
+    window_size = 7
     def create_sequences(data, dates, window_size):
         X, y, target_dates = [], [], []
         for i in range(len(data) - window_size):
@@ -125,16 +139,9 @@ def get_forecast():
     X_all, y_all, target_dates = create_sequences(df["y"].values, df["ds"], window_size)
     target_dates = pd.to_datetime(target_dates)
     
-    # Use all available sequences for training (to capture full variability)
-    X_train = X_all
+    X_train = X_all.reshape(-1, window_size, 1)
     y_train = y_all
     
-    # Reshape for LSTM: (samples, timesteps, features)
-    X_train = X_train.reshape(-1, window_size, 1)
-    
-    # ---------------------------
-    # Build a Deeper LSTM Model
-    # ---------------------------
     lstm_model = Sequential()
     lstm_model.add(LSTM(50, activation='relu', return_sequences=True, input_shape=(window_size, 1)))
     lstm_model.add(LSTM(25, activation='relu'))
@@ -144,14 +151,10 @@ def get_forecast():
     
     lstm_model.fit(X_train, y_train, epochs=100, batch_size=16, verbose=0)
     
-    # Report in-sample RMSE (training error)
     y_train_pred = lstm_model.predict(X_train)
     train_rmse = np.sqrt(mean_squared_error(y_train, y_train_pred))
     st.write("**Training RMSE (LSTM):**", train_rmse)
     
-    # ---------------------------
-    # Recursive Forecasting for the Next 30 Days Using LSTM
-    # ---------------------------
     last_window = df["y"].values[-window_size:]
     extended = list(last_window)
     last_date_forecast = df["ds"].iloc[-1]
@@ -184,7 +187,6 @@ st.line_chart(forecast_df.set_index("ds")["y_pred"])
 st.write("### Forecast Data Table")
 st.dataframe(forecast_df)
 
-# A refresh button to update the forecast manually (clears the cache)
 if st.button("Refresh Forecast Now"):
     get_forecast.clear()
     historical_df, forecast_df = get_forecast()
@@ -198,11 +200,9 @@ countdown_html = """
   <body style="background-color: transparent; margin: 0; padding: 0;">
     <div id="countdown" style="font-size:20px; font-weight: bold; color: white; text-align: center;"></div>
     <script>
-      // Compute the remaining time until next midnight
       var now = new Date();
       var tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
       var distance = tomorrow - now;
-      var totalTime = distance / 1000;  // in seconds
       var x = setInterval(function() {
           var now = new Date().getTime();
           var distance = tomorrow - now;
